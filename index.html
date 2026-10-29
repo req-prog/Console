@@ -75,7 +75,7 @@ dialog h2{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       <div class="row"><input id="ft" placeholder="Название (можно пустым)"><button class="go" id="pick">Выбрать видео</button></div>
       <input id="file" type="file" accept="video/*" hidden>
       <div class="bar" id="barw" hidden><i id="bar"></i></div>
-      <div class="hint" id="uph">Видео до 50 МБ. Лучше всего формат MP4: .mov с iPhone играет не у всех.</div>
+      <div class="hint" id="uph">Видео до 300 МБ. Всё, что больше 48 МБ, само режется на части при загрузке. Лучше всего формат MP4: .mov с iPhone играет не у всех.</div>
     </div>
     <div class="card">
       <h2>Или добавить ссылкой</h2>
@@ -130,19 +130,49 @@ async function loadList() {
   data.forEach(v => {
     const li = document.createElement("li"); li.className = "vid";
     const t = document.createElement("span"); t.textContent = v.title;
+    const mm = parseMulti(v.url); if (mm) { const sm = document.createElement("small"); sm.textContent = " · " + mm.n + " ч."; t.appendChild(sm); }
     const go = document.createElement("button"); go.className = "go"; go.textContent = "В эфир";
     go.onclick = () => openLaunch(v);
     const del = document.createElement("button"); del.textContent = "Удалить";
-    del.onclick = async () => { if (confirm("Удалить «" + v.title + "»?")) { await rpc("admin_del", { vid: v.id }); const m = v.url.split("/object/public/videos/")[1]; if (m) await fetch(SUPABASE_URL + "/storage/v1/object/videos/" + m, { method: "DELETE", headers: { apikey: SUPABASE_KEY, Authorization: "Bearer " + SUPABASE_KEY, "x-admin-pass": PASS } }).catch(() => {}); loadList(); } };
+    del.onclick = async () => { if (confirm("Удалить «" + v.title + "»?")) { await rpc("admin_del", { vid: v.id }); const mm = parseMulti(v.url); const base = (mm ? mm.base : v.url).split("/object/public/videos/")[1]; if (base) await Promise.all((mm ? Array.from({ length: mm.n }, (_, i) => base + ".p" + i) : [base]).map(delObj)); loadList(); } };
     li.append(t, go, del); ul.appendChild(li);
   });
 }
+// ---- составные видео: файл >48 МБ хранится кусками .p0 .p1 ... , в ссылке после # описано, сколько частей ----
+function parseMulti(url) {
+  const i = (url || "").indexOf("#"); if (i < 0) return null;
+  const q = new URLSearchParams(url.slice(i + 1)), n = +q.get("parts");
+  if (!(n > 1)) return null;
+  return { base: url.slice(0, i), n, size: +q.get("size") || 0, dur: +q.get("dur") || null, type: q.get("type") || "video/mp4" };
+}
+const newCtl = () => { const c = { aborted: false, xs: [], abort() { c.aborted = true; c.xs.forEach(x => { try { x.abort(); } catch (e) {} }); } }; return c; };
+// скачивает все части и склеивает в один blob: возвращает ссылку, которую понимает <video>
+function loadMedia(m, onp, ctl) {
+  const got = new Array(m.n).fill(0);
+  const report = () => onp(m.size ? Math.min(got.reduce((a, b) => a + b, 0) / m.size, 0.99) : 0);
+  const one = i => new Promise((res, rej) => {
+    let tries = 0;
+    const go = () => {
+      const x = new XMLHttpRequest(); ctl.xs.push(x);
+      x.open("GET", m.base + ".p" + i); x.responseType = "blob";
+      x.onprogress = e => { got[i] = e.loaded; report(); };
+      x.onload = () => x.status === 200 ? res(x.response) : fail();
+      x.onerror = () => fail();
+      const fail = () => { if (ctl.aborted) return rej(new Error("abort")); if (++tries < 3) setTimeout(go, 1000 * tries); else rej(new Error("part " + i)); };
+      x.send();
+    };
+    go();
+  });
+  return Promise.all(Array.from({ length: m.n }, (_, i) => one(i))).then(parts => URL.createObjectURL(new Blob(parts, { type: m.type })));
+}
+
 const fmt = x => { x = Math.max(0, x | 0); return Math.floor(x / 60) + ":" + String(x % 60).padStart(2, "0"); };
 let curB = null, offset = 0, dragging = false, durCache = { url: null, d: null };
 const posNow = () => !curB ? 0 : curB.paused ? (curB.pause_pos || 0) : (Date.now() + offset - new Date(curB.started_at).getTime()) / 1000;
 const bdur = () => curB && (curB.duration || durCache.d) || 0;
 
 function probe(url) {
+  const mm = parseMulti(url); if (mm) return Promise.resolve(mm.dur);
   return new Promise(res => {
     const t = document.createElement("video"); t.preload = "metadata";
     let to; const done = d => { clearTimeout(to); t.removeAttribute("src"); t.load(); res(d); };
@@ -226,10 +256,10 @@ $("qclear").onclick = async () => {
 
 // ---- окно запуска: выбор места старта + «в очередь / прервать» ----
 const dlg = $("dlg"), pv = $("pv"), ps = $("ps");
-let lv = null, pvDur = null, pvDrag = false;
+let lv = null, pvDur = null, pvDrag = false, pvCtl = null, pvBlob = null;
 const startAt = () => { let x = Math.round((+ps.value || 0) * 10) / 10; if (pvDur) x = Math.min(x, Math.max(0, pvDur - 1)); return Math.max(0, x); };
 function openLaunch(item) {
-  lv = item; pvDur = null;
+  lv = item; pvDur = null; if (pvCtl) pvCtl.abort(); pvCtl = null;
   const live = !!(curB && curB.is_live);
   $("dt").textContent = item.title;
   $("dq").textContent = live
@@ -249,7 +279,18 @@ function openLaunch(item) {
   $("pwarn").textContent = "Двигай ползунок, чтобы выбрать, с какого места начнётся мультик.";
   pv.onloadedmetadata = () => { pvDur = isFinite(pv.duration) ? pv.duration : null; if (pvDur) ps.max = pvDur; };
   pv.onerror = () => { $("pwarn").textContent = "Не удалось загрузить превью: место старта выбрать нельзя, а переход к очереди после этого видео может не сработать."; };
-  pv.src = item.url; pv.load();
+  const m = parseMulti(item.url);
+  if (m) {
+    pvDur = m.dur; if (pvDur) ps.max = pvDur;
+    $("pvp").disabled = true;
+    const ctl = pvCtl = newCtl();
+    $("pwarn").textContent = "Большое видео из " + m.n + " частей. Загружаю превью: 0%";
+    loadMedia(m, p => { if (!ctl.aborted) $("pwarn").textContent = "Загружаю превью: " + Math.round(p * 100) + "%"; }, ctl).then(u => {
+      if (ctl.aborted) { URL.revokeObjectURL(u); return; }
+      pvBlob = u; pv.src = u; pv.load(); $("pvp").disabled = false;
+      $("pwarn").textContent = "Двигай ползунок, чтобы выбрать, с какого места начнётся мультик.";
+    }).catch(() => { if (!ctl.aborted) $("pwarn").textContent = "Не удалось загрузить превью. Можно запускать с начала или двигать ползунок вслепую."; });
+  } else { pv.src = item.url; pv.load(); }
   dlg.showModal();
 }
 async function launch(fn) {
@@ -257,7 +298,7 @@ async function launch(fn) {
   if (error) { alert(error.message); return; }
   dlg.close(); refresh();
 }
-dlg.addEventListener("close", () => { pv.pause(); pv.removeAttribute("src"); pv.load(); });
+dlg.addEventListener("close", () => { if (pvCtl) pvCtl.abort(); pvCtl = null; pv.pause(); pv.removeAttribute("src"); pv.load(); if (pvBlob) URL.revokeObjectURL(pvBlob); pvBlob = null; $("pvp").disabled = false; });
 ps.oninput = () => { pvDrag = true; $("pst").textContent = fmt(+ps.value); if (pvDur) pv.currentTime = +ps.value; };
 ps.onchange = () => { pvDrag = false; };
 pv.ontimeupdate = () => { if (!pvDrag) { ps.value = pv.currentTime; $("pst").textContent = fmt(pv.currentTime); } };
@@ -290,30 +331,79 @@ $("add").onclick = async () => {
 };
 
 const BASE = SUPABASE_URL + "/storage/v1/object/";
+const CH = 48 * 1024 * 1024, MAXF = 300 * 1024 * 1024;
+const OKTYPES = ["video/mp4", "video/webm", "video/quicktime", "video/x-matroska", "video/x-m4v"];
+const delObj = path => fetch(BASE + "videos/" + path, { method: "DELETE", headers: { apikey: SUPABASE_KEY, Authorization: "Bearer " + SUPABASE_KEY, "x-admin-pass": PASS } }).catch(() => {});
+function putObj(path, blob, mime, onp) {
+  return new Promise((res, rej) => {
+    let tries = 0;
+    const go = () => {
+      const x = new XMLHttpRequest();
+      x.open("POST", BASE + "videos/" + path);
+      x.setRequestHeader("apikey", SUPABASE_KEY);
+      x.setRequestHeader("Authorization", "Bearer " + SUPABASE_KEY);
+      x.setRequestHeader("x-admin-pass", PASS);
+      x.setRequestHeader("Content-Type", mime);
+      x.upload.onprogress = e => { if (e.lengthComputable) onp(e.loaded); };
+      const retry = (msg, final) => { if (final || ++tries >= 3) rej(new Error(msg)); else setTimeout(go, 1500 * tries); };
+      x.onload = () => (x.status >= 200 && x.status < 300) ? res() : retry("Не загрузилось (" + x.status + "): " + x.responseText.slice(0, 120), x.status >= 400 && x.status < 500);
+      x.onerror = () => retry("Нет связи. Попробуй ещё раз.");
+      x.send(blob);
+    };
+    go();
+  });
+}
+function fileDuration(f) {
+  return new Promise(res => {
+    const u = URL.createObjectURL(f), t = document.createElement("video"); let to;
+    const done = d => { clearTimeout(to); t.removeAttribute("src"); t.load(); URL.revokeObjectURL(u); res(d); };
+    t.preload = "metadata";
+    t.onloadedmetadata = () => done(isFinite(t.duration) ? t.duration : null);
+    t.onerror = () => done(null);
+    to = setTimeout(() => done(null), 15000);
+    t.src = u;
+  });
+}
 $("pick").onclick = () => $("file").click();
-$("file").onchange = () => {
+$("file").onchange = async () => {
   const f = $("file").files[0]; if (!f) return;
-  if (f.size > 52428800) { $("uph").textContent = "Файл больше 50 МБ. Сожми видео или добавь ссылкой."; $("file").value = ""; return; }
+  if (f.size > MAXF) { $("uph").textContent = "Файл больше 300 МБ. Сожми видео или добавь ссылкой."; $("file").value = ""; return; }
   const ext = (f.name.split(".").pop() || "mp4").toLowerCase().replace(/[^a-z0-9]/g, "") || "mp4";
-  const path = Date.now() + "-" + Math.random().toString(36).slice(2, 8) + "." + ext;
+  const base = Date.now() + "-" + Math.random().toString(36).slice(2, 8) + "." + ext;
   const title = $("ft").value.trim() || f.name.replace(/\.[^.]+$/, "");
-  const x = new XMLHttpRequest();
-  x.open("POST", BASE + "videos/" + path);
-  x.setRequestHeader("apikey", SUPABASE_KEY);
-  x.setRequestHeader("Authorization", "Bearer " + SUPABASE_KEY);
-  x.setRequestHeader("x-admin-pass", PASS);
-  x.setRequestHeader("Content-Type", f.type || "video/mp4");
+  const mime = OKTYPES.includes(f.type) ? f.type : "video/mp4";
+  const n = Math.ceil(f.size / CH), done = [];
   $("barw").hidden = false; $("bar").style.width = "0"; $("pick").disabled = true;
-  x.upload.onprogress = e => { if (e.lengthComputable) { const p = Math.round(e.loaded / e.total * 100); $("bar").style.width = p + "%"; $("uph").textContent = "Загружаю… " + p + "%"; } };
-  x.onload = async () => {
-    $("pick").disabled = false; $("file").value = "";
-    if (x.status < 200 || x.status > 299) { $("uph").textContent = "Не загрузилось (" + x.status + "): " + x.responseText.slice(0, 120); return; }
-    const { error } = await rpc("admin_add", { t: title, u: BASE + "public/videos/" + path });
-    $("uph").textContent = error ? error.message : "Готово: «" + title + "» в библиотеке. Жми «В эфир».";
-    if (!error) { $("ft").value = ""; loadList(); }
+  const prog = (loaded, i) => {
+    const p = Math.round(loaded / f.size * 100); $("bar").style.width = p + "%";
+    $("uph").textContent = "Загружаю… " + p + "%" + (n > 1 ? " (часть " + (i + 1) + " из " + n + ")" : "");
   };
-  x.onerror = () => { $("pick").disabled = false; $("uph").textContent = "Нет связи. Попробуй ещё раз."; };
-  x.send(f);
+  try {
+    let url;
+    if (n === 1) {
+      await putObj(base, f, mime, l => prog(l, 0));
+      done.push(base);
+      url = BASE + "public/videos/" + base;
+    } else {
+      $("uph").textContent = "Читаю видео…";
+      const dur = await fileDuration(f);
+      let sent = 0;
+      for (let i = 0; i < n; i++) {
+        const part = f.slice(i * CH, (i + 1) * CH);
+        await putObj(base + ".p" + i, part, mime, l => prog(sent + l, i));
+        done.push(base + ".p" + i); sent += part.size;
+      }
+      const q = new URLSearchParams({ parts: n, size: f.size, type: mime }); if (dur) q.set("dur", dur.toFixed(2));
+      url = BASE + "public/videos/" + base + "#" + q;
+    }
+    const { error } = await rpc("admin_add", { t: title, u: url });
+    if (error) throw new Error(error.message);
+    $("uph").textContent = "Готово: «" + title + "» в библиотеке" + (n > 1 ? " (" + n + " частей)" : "") + ". Жми «В эфир».";
+    $("ft").value = ""; loadList();
+  } catch (e) {
+    await Promise.all(done.map(delObj));   // откат: не оставляем недогруженные куски
+    $("uph").textContent = e.message;
+  } finally { $("pick").disabled = false; $("file").value = ""; }
 };
 $("off").onclick = async () => { const { error } = await rpc("admin_bc_stop"); if (error) alert(error.message); refresh(); };
 $("chg").onclick = async () => {
