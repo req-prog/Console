@@ -29,6 +29,20 @@ li.vid span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bar{height:10px;background:var(--bg);border-radius:6px;margin-top:12px;overflow:hidden}.bar i{display:block;height:100%;width:0;background:var(--amber)}
 .err{color:var(--pink);margin-top:8px;min-height:1.4em}
 #app{display:none}
+.status.paused .dot{background:var(--amber)}
+.ctl{align-items:center}
+.seekrow{display:flex;align-items:center;gap:8px;margin-top:14px}
+.seekrow input[type=range]{flex:1;padding:0;border:0;background:none;accent-color:var(--amber);height:28px}
+.seekrow button{padding:8px 12px}
+.seekrow span{font-size:14px;color:var(--dim);min-width:44px;text-align:right}
+li.vid small{color:var(--dim)}
+dialog{margin:auto;background:var(--bg2);color:var(--ink);border:1px solid var(--line);border-radius:18px;padding:18px;width:min(520px,calc(100vw - 24px))}
+dialog::backdrop{background:#000b}
+dialog h2{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#pv{width:100%;aspect-ratio:16/9;background:#000;border-radius:12px;margin-top:12px;display:block}
+.dq{margin-top:4px}
+.dact{margin-top:14px}
+.dact button{flex:1}
 </style>
 </head>
 <body>
@@ -43,8 +57,19 @@ li.vid span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
   <div id="app">
     <div class="card">
-      <div class="status" id="st"><div><span class="dot"></span><strong id="stt">Эфир выключен</strong></div><button class="stop" id="off">Остановить эфир</button></div>
+      <div class="status" id="st"><div><span class="dot"></span><strong id="stt">Эфир выключен</strong></div>
+        <div class="row ctl">
+          <button class="go" id="pp" hidden>⏸ Пауза</button>
+          <button id="nx" hidden>⏭ Следующее</button>
+          <button class="stop" id="off">Остановить эфир</button>
+        </div>
+      </div>
+      <div id="seek" hidden>
+        <div class="seekrow"><button id="bk">−10с</button><input type="range" id="sk" min="0" max="100" step="1" value="0" aria-label="Перемотка эфира"><button id="fw">+10с</button></div>
+        <div class="hint"><span id="skt">0:00 / 0:00</span> · тяни ползунок, чтобы перемотать эфир у всех зрителей</div>
+      </div>
     </div>
+    <div class="card"><h2>Очередь <span id="qc"></span></h2><ul id="queue"></ul><div class="row" style="margin-top:10px"><button id="qclear" hidden>Очистить очередь</button></div></div>
     <div class="card">
       <h2>Загрузить из галереи</h2>
       <div class="row"><input id="ft" placeholder="Название (можно пустым)"><button class="go" id="pick">Выбрать видео</button></div>
@@ -60,6 +85,14 @@ li.vid span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     </div>
     <div class="card"><h2>Библиотека</h2><ul id="list"></ul></div>
     <div class="card"><h2>Сейчас онлайн: <span id="cnt">0</span></h2><ul id="users"></ul></div>
+    <dialog id="dlg">
+      <h2 id="dt">Запуск</h2>
+      <p class="dq" id="dq"></p>
+      <video id="pv" playsinline preload="metadata"></video>
+      <div class="seekrow"><button id="pvp" aria-label="Смотреть превью">▶</button><input type="range" id="ps" min="0" max="100" step="0.5" value="0" aria-label="Откуда начать"><span id="pst">0:00</span></div>
+      <div class="hint" id="pwarn">Двигай ползунок, чтобы выбрать, с какого места начнётся мультик.</div>
+      <div class="row dact" id="dact"></div>
+    </dialog>
     <div class="card"><h2>Сменить пароль</h2><div class="row"><input id="np" type="password" placeholder="Новый пароль (от 6 символов)"><button id="chg">Сменить</button></div><div class="err" id="perr"></div></div>
     <button id="out">Выйти</button>
   </div>
@@ -98,23 +131,148 @@ async function loadList() {
     const li = document.createElement("li"); li.className = "vid";
     const t = document.createElement("span"); t.textContent = v.title;
     const go = document.createElement("button"); go.className = "go"; go.textContent = "В эфир";
-    go.onclick = async () => { const { error } = await rpc("admin_launch", { t: v.title, u: v.url }); if (error) alert(error.message); };
+    go.onclick = () => openLaunch(v);
     const del = document.createElement("button"); del.textContent = "Удалить";
     del.onclick = async () => { if (confirm("Удалить «" + v.title + "»?")) { await rpc("admin_del", { vid: v.id }); const m = v.url.split("/object/public/videos/")[1]; if (m) await fetch(SUPABASE_URL + "/storage/v1/object/videos/" + m, { method: "DELETE", headers: { apikey: SUPABASE_KEY, Authorization: "Bearer " + SUPABASE_KEY, "x-admin-pass": PASS } }).catch(() => {}); loadList(); } };
     li.append(t, go, del); ul.appendChild(li);
   });
 }
-function showStatus(b) {
-  const on = b && b.is_live;
-  $("st").classList.toggle("live", !!on);
-  $("stt").textContent = on ? "В эфире: " + b.title : "Эфир выключен";
+const fmt = x => { x = Math.max(0, x | 0); return Math.floor(x / 60) + ":" + String(x % 60).padStart(2, "0"); };
+let curB = null, offset = 0, dragging = false, durCache = { url: null, d: null };
+const posNow = () => !curB ? 0 : curB.paused ? (curB.pause_pos || 0) : (Date.now() + offset - new Date(curB.started_at).getTime()) / 1000;
+const bdur = () => curB && (curB.duration || durCache.d) || 0;
+
+function probe(url) {
+  return new Promise(res => {
+    const t = document.createElement("video"); t.preload = "metadata";
+    let to; const done = d => { clearTimeout(to); t.removeAttribute("src"); t.load(); res(d); };
+    t.onloadedmetadata = () => done(isFinite(t.duration) ? t.duration : null);
+    t.onerror = () => done(null);
+    to = setTimeout(() => done(null), 10000);
+    t.src = url;
+  });
 }
+function renderQueue(q) {
+  const ul = $("queue"); ul.innerHTML = "";
+  $("qc").textContent = q.length ? "(" + q.length + ")" : "";
+  $("qclear").hidden = !q.length;
+  if (!q.length) { const li = document.createElement("li"); li.className = "hint"; li.textContent = "Очередь пуста. Пока что-то идёт в эфире, нажми «В эфир» у другого видео и выбери «Добавить в очередь»."; ul.appendChild(li); return; }
+  q.forEach((it, i) => {
+    const li = document.createElement("li"); li.className = "vid";
+    const t = document.createElement("span");
+    t.textContent = (i + 1) + ". " + it.title + (it.start > 0 ? " · с " + fmt(it.start) : "");
+    const x = document.createElement("button"); x.textContent = "✕"; x.setAttribute("aria-label", "Убрать из очереди");
+    x.onclick = async () => { const { error } = await rpc("admin_dequeue", { qid: it.id }); if (error) alert(error.message); refresh(); };
+    li.append(t, x); ul.appendChild(li);
+  });
+}
+function showStatus(b) {
+  curB = b;
+  const on = !!(b && b.is_live), paused = !!(b && b.paused);
+  $("st").classList.toggle("live", on && !paused);
+  $("st").classList.toggle("paused", on && paused);
+  $("stt").textContent = on ? (paused ? "На паузе: " : "В эфире: ") + b.title : "Эфир выключен";
+  $("pp").hidden = !on;
+  $("pp").textContent = paused ? "▶ Продолжить" : "⏸ Пауза";
+  $("seek").hidden = !on;
+  const q = (b && b.queue) || [];
+  $("nx").hidden = !q.length;
+  renderQueue(q);
+  if (on && !b.duration && durCache.url !== b.video_url) {
+    const u = b.video_url; durCache = { url: u, d: null };
+    probe(u).then(d => { if (durCache.url === u) durCache.d = d; });
+  }
+  updSeek();
+}
+async function refresh() {
+  const { data } = await sb.from("broadcast").select("*").eq("id", 1).single();
+  if (data) showStatus(data);
+}
+function updSeek() {
+  if (!curB || !curB.is_live || dragging) return;
+  const d = bdur(), p = Math.min(Math.max(posNow(), 0), d || 1e9);
+  $("sk").max = d || Math.max(p, 1); $("sk").value = p;
+  $("skt").textContent = fmt(p) + " / " + (d ? fmt(d) : "?");
+}
+setInterval(updSeek, 500);
+setInterval(() => { if (inited) refresh(); }, 10000);
+
+async function seekTo(x) {
+  const d = bdur();
+  x = Math.max(0, d ? Math.min(x, d - 1) : x);
+  const { error } = await rpc("admin_seek", { st: x });
+  if (error) alert(error.message);
+  await refresh();
+}
+$("sk").oninput = () => { dragging = true; $("skt").textContent = fmt(+$("sk").value) + " / " + (bdur() ? fmt(bdur()) : "?"); };
+$("sk").onchange = async () => { await seekTo(+$("sk").value); dragging = false; };
+$("bk").onclick = () => seekTo(posNow() - 10);
+$("fw").onclick = () => seekTo(posNow() + 10);
+$("pp").onclick = async () => {
+  const { error } = await rpc(curB && curB.paused ? "admin_resume" : "admin_pause");
+  if (error) alert(error.message);
+  refresh();
+};
+$("nx").onclick = async () => {
+  if (curB && curB.is_live && !confirm("Прервать «" + curB.title + "» и включить следующее из очереди?")) return;
+  const { error } = await rpc("admin_next");
+  if (error) alert(error.message);
+  refresh();
+};
+$("qclear").onclick = async () => {
+  if (!confirm("Очистить очередь?")) return;
+  const { error } = await rpc("admin_queue_clear"); if (error) alert(error.message); refresh();
+};
+
+// ---- окно запуска: выбор места старта + «в очередь / прервать» ----
+const dlg = $("dlg"), pv = $("pv"), ps = $("ps");
+let lv = null, pvDur = null, pvDrag = false;
+const startAt = () => { let x = Math.round((+ps.value || 0) * 10) / 10; if (pvDur) x = Math.min(x, Math.max(0, pvDur - 1)); return Math.max(0, x); };
+function openLaunch(item) {
+  lv = item; pvDur = null;
+  const live = !!(curB && curB.is_live);
+  $("dt").textContent = item.title;
+  $("dq").textContent = live
+    ? "Сейчас идёт «" + curB.title + "»" + (curB.paused ? " (на паузе)" : "") + ". Добавить в очередь или прервать?"
+    : "Эфир сейчас выключен.";
+  const box = $("dact"); box.innerHTML = "";
+  const mk = (txt, cls, fn) => { const b = document.createElement("button"); b.textContent = txt; if (cls) b.className = cls; b.onclick = fn; box.appendChild(b); };
+  if (live) {
+    mk("Добавить в очередь", "go", () => launch("admin_enqueue"));
+    mk("Прервать и включить", "stop", () => launch("admin_play"));
+  } else {
+    mk("В эфир", "go", () => launch("admin_play"));
+    mk("В очередь", "", () => launch("admin_enqueue"));
+  }
+  mk("Отмена", "", () => dlg.close());
+  ps.value = 0; ps.max = 100; $("pst").textContent = "0:00"; $("pvp").textContent = "▶";
+  $("pwarn").textContent = "Двигай ползунок, чтобы выбрать, с какого места начнётся мультик.";
+  pv.onloadedmetadata = () => { pvDur = isFinite(pv.duration) ? pv.duration : null; if (pvDur) ps.max = pvDur; };
+  pv.onerror = () => { $("pwarn").textContent = "Не удалось загрузить превью: место старта выбрать нельзя, а переход к очереди после этого видео может не сработать."; };
+  pv.src = item.url; pv.load();
+  dlg.showModal();
+}
+async function launch(fn) {
+  const { error } = await rpc(fn, { t: lv.title, u: lv.url, st: startAt(), d: pvDur });
+  if (error) { alert(error.message); return; }
+  dlg.close(); refresh();
+}
+dlg.addEventListener("close", () => { pv.pause(); pv.removeAttribute("src"); pv.load(); });
+ps.oninput = () => { pvDrag = true; $("pst").textContent = fmt(+ps.value); if (pvDur) pv.currentTime = +ps.value; };
+ps.onchange = () => { pvDrag = false; };
+pv.ontimeupdate = () => { if (!pvDrag) { ps.value = pv.currentTime; $("pst").textContent = fmt(pv.currentTime); } };
+pv.onended = () => { $("pvp").textContent = "▶"; };
+$("pvp").onclick = () => {
+  if (pv.paused) { pv.play().catch(() => {}); $("pvp").textContent = "⏸"; }
+  else { pv.pause(); $("pvp").textContent = "▶"; }
+};
+
 let inited = false;
 async function init() {
   if (inited) return; inited = true;
   loadList();
-  const { data } = await sb.from("broadcast").select("*").eq("id", 1).single();
-  showStatus(data);
+  try { const { data: now } = await sb.rpc("server_now"); if (now) offset = new Date(now).getTime() - Date.now(); } catch (e) {}
+  await refresh();
   sb.channel("admin-bc").on("postgres_changes", { event: "UPDATE", schema: "public", table: "broadcast" }, p => showStatus(p.new)).subscribe();
   const ch = sb.channel("roptv-online");
   ch.on("presence", { event: "sync" }, () => {
@@ -157,7 +315,7 @@ $("file").onchange = () => {
   x.onerror = () => { $("pick").disabled = false; $("uph").textContent = "Нет связи. Попробуй ещё раз."; };
   x.send(f);
 };
-$("off").onclick = async () => { const { error } = await rpc("admin_stop"); if (error) alert(error.message); };
+$("off").onclick = async () => { const { error } = await rpc("admin_bc_stop"); if (error) alert(error.message); refresh(); };
 $("chg").onclick = async () => {
   const np = $("np").value;
   const { error } = await rpc("admin_set_pass", { newp: np });
