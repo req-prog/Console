@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>RopTV — пульт эфира</title>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@600;900&family=Manrope:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#14123a;--bg2:#1d1a52;--ink:#f3eeff;--dim:#a9a3d6;--amber:#ffb400;--pink:#ff3d6e;--line:#2f2b78}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--ink);font:400 16px/1.5 Manrope,system-ui,sans-serif;min-height:100vh;padding:20px 16px 40px}
+.wrap{max-width:900px;margin:0 auto}
+h1{font:900 26px Unbounded;margin-bottom:18px}h1 b{color:var(--amber)}
+h2{font:600 16px Unbounded;margin-bottom:12px}
+.card{background:var(--bg2);border:1px solid var(--line);border-radius:18px;padding:18px;margin-bottom:16px}
+input{background:var(--bg);border:1px solid var(--line);color:var(--ink);padding:10px 12px;border-radius:10px;font:inherit;width:100%}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row>input{flex:1;min-width:180px}
+button{border:0;border-radius:10px;padding:10px 16px;font:600 14px Manrope;cursor:pointer;background:var(--line);color:var(--ink)}
+button.go{background:var(--amber);color:#1a1200}button.stop{background:var(--pink);color:#fff}
+button:focus-visible,input:focus-visible{outline:3px solid var(--amber)}
+.status{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--dim);margin-right:8px}
+.live .dot{background:var(--pink)}
+ul{list-style:none;padding:0;display:grid;gap:8px}
+li.vid{display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--bg);border-radius:12px}
+li.vid span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hint{color:var(--dim);font-size:14px;margin-top:8px}
+.bar{height:10px;background:var(--bg);border-radius:6px;margin-top:12px;overflow:hidden}.bar i{display:block;height:100%;width:0;background:var(--amber)}
+.err{color:var(--pink);margin-top:8px;min-height:1.4em}
+#app{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Rop<b>TV</b> · пульт эфира</h1>
+
+  <div class="card" id="login">
+    <h2>Вход для админа</h2>
+    <div class="row"><input id="pw" type="password" placeholder="Пароль админа" autocomplete="current-password"><button class="go" id="in">Войти</button></div>
+    <div class="err" id="lerr"></div>
+  </div>
+
+  <div id="app">
+    <div class="card">
+      <div class="status" id="st"><div><span class="dot"></span><strong id="stt">Эфир выключен</strong></div><button class="stop" id="off">Остановить эфир</button></div>
+    </div>
+    <div class="card">
+      <h2>Загрузить из галереи</h2>
+      <div class="row"><input id="ft" placeholder="Название (можно пустым)"><button class="go" id="pick">Выбрать видео</button></div>
+      <input id="file" type="file" accept="video/*" hidden>
+      <div class="bar" id="barw" hidden><i id="bar"></i></div>
+      <div class="hint" id="uph">Видео до 50 МБ. Лучше всего формат MP4: .mov с iPhone играет не у всех.</div>
+    </div>
+    <div class="card">
+      <h2>Или добавить ссылкой</h2>
+      <div class="row"><input id="vt" placeholder="Название"><input id="vu" placeholder="Прямая ссылка на видеофайл (.mp4 / .webm)"><button class="go" id="add">Добавить</button></div>
+      <div class="hint">Подойдёт любая прямая ссылка на .mp4 или .webm.</div>
+      <div class="err" id="verr"></div>
+    </div>
+    <div class="card"><h2>Библиотека</h2><ul id="list"></ul></div>
+    <div class="card"><h2>Сейчас онлайн: <span id="cnt">0</span></h2><ul id="users"></ul></div>
+    <div class="card"><h2>Сменить пароль</h2><div class="row"><input id="np" type="password" placeholder="Новый пароль (от 6 символов)"><button id="chg">Сменить</button></div><div class="err" id="perr"></div></div>
+    <button id="out">Выйти</button>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<script>
+const SUPABASE_URL = "https://qxguizijvutacxvfkovc.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF4Z3VpemlqdnV0YWN4dmZrb3ZjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMyMjkzNzIsImV4cCI6MjEwODgwNTM3Mn0.u7SUyx_HnmZYxItnz_ByBA7FP8jDqNvy20jrQnwsgMw";
+
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+const $ = id => document.getElementById(id);
+let PASS = null;
+const rpc = (fn, args = {}) => sb.rpc(fn, { p: PASS, ...args });
+
+function enter(ok) {
+  $("login").style.display = ok ? "none" : "block";
+  $("app").style.display = ok ? "block" : "none";
+  if (ok) init();
+}
+$("in").onclick = async () => {
+  const pw = $("pw").value;
+  const { data, error } = await sb.rpc("admin_check", { p: pw });
+  if (error || !data) { $("lerr").textContent = "Неверный пароль."; return; }
+  PASS = pw; sessionStorage.setItem("roptv_admin", pw); $("lerr").textContent = ""; enter(true);
+};
+$("pw").onkeydown = e => { if (e.key === "Enter") $("in").click(); };
+$("out").onclick = () => { sessionStorage.removeItem("roptv_admin"); location.reload(); };
+
+async function loadList() {
+  const { data, error } = await rpc("admin_videos");
+  const ul = $("list"); ul.innerHTML = "";
+  if (error) { ul.innerHTML = '<li class="hint">' + error.message + '</li>'; return; }
+  if (!data.length) ul.innerHTML = '<li class="hint">Пока пусто. Добавь первое видео выше.</li>';
+  data.forEach(v => {
+    const li = document.createElement("li"); li.className = "vid";
+    const t = document.createElement("span"); t.textContent = v.title;
+    const go = document.createElement("button"); go.className = "go"; go.textContent = "В эфир";
+    go.onclick = async () => { const { error } = await rpc("admin_launch", { t: v.title, u: v.url }); if (error) alert(error.message); };
+    const del = document.createElement("button"); del.textContent = "Удалить";
+    del.onclick = async () => { if (confirm("Удалить «" + v.title + "»?")) { await rpc("admin_del", { vid: v.id }); const m = v.url.split("/object/public/videos/")[1]; if (m) await fetch(SUPABASE_URL + "/storage/v1/object/videos/" + m, { method: "DELETE", headers: { apikey: SUPABASE_KEY, Authorization: "Bearer " + SUPABASE_KEY, "x-admin-pass": PASS } }).catch(() => {}); loadList(); } };
+    li.append(t, go, del); ul.appendChild(li);
+  });
+}
+function showStatus(b) {
+  const on = b && b.is_live;
+  $("st").classList.toggle("live", !!on);
+  $("stt").textContent = on ? "В эфире: " + b.title : "Эфир выключен";
+}
+let inited = false;
+async function init() {
+  if (inited) return; inited = true;
+  loadList();
+  const { data } = await sb.from("broadcast").select("*").eq("id", 1).single();
+  showStatus(data);
+  sb.channel("admin-bc").on("postgres_changes", { event: "UPDATE", schema: "public", table: "broadcast" }, p => showStatus(p.new)).subscribe();
+  const ch = sb.channel("roptv-online");
+  ch.on("presence", { event: "sync" }, () => {
+    const st = ch.presenceState(), ul = $("users"); ul.innerHTML = "";
+    Object.values(st).forEach(m => { const li = document.createElement("li"); li.textContent = m[0].name; ul.appendChild(li); });
+    $("cnt").textContent = Object.keys(st).length;
+  }).subscribe();
+}
+$("add").onclick = async () => {
+  const t = $("vt").value.trim(), u = $("vu").value.trim();
+  if (!t || !/^https?:\/\//.test(u)) { $("verr").textContent = "Нужны название и ссылка, которая начинается с http."; return; }
+  const { error } = await rpc("admin_add", { t, u });
+  $("verr").textContent = error ? error.message : "";
+  if (!error) { $("vt").value = $("vu").value = ""; loadList(); }
+};
+
+const BASE = SUPABASE_URL + "/storage/v1/object/";
+$("pick").onclick = () => $("file").click();
+$("file").onchange = () => {
+  const f = $("file").files[0]; if (!f) return;
+  if (f.size > 52428800) { $("uph").textContent = "Файл больше 50 МБ. Сожми видео или добавь ссылкой."; $("file").value = ""; return; }
+  const ext = (f.name.split(".").pop() || "mp4").toLowerCase().replace(/[^a-z0-9]/g, "") || "mp4";
+  const path = Date.now() + "-" + Math.random().toString(36).slice(2, 8) + "." + ext;
+  const title = $("ft").value.trim() || f.name.replace(/\.[^.]+$/, "");
+  const x = new XMLHttpRequest();
+  x.open("POST", BASE + "videos/" + path);
+  x.setRequestHeader("apikey", SUPABASE_KEY);
+  x.setRequestHeader("Authorization", "Bearer " + SUPABASE_KEY);
+  x.setRequestHeader("x-admin-pass", PASS);
+  x.setRequestHeader("Content-Type", f.type || "video/mp4");
+  $("barw").hidden = false; $("bar").style.width = "0"; $("pick").disabled = true;
+  x.upload.onprogress = e => { if (e.lengthComputable) { const p = Math.round(e.loaded / e.total * 100); $("bar").style.width = p + "%"; $("uph").textContent = "Загружаю… " + p + "%"; } };
+  x.onload = async () => {
+    $("pick").disabled = false; $("file").value = "";
+    if (x.status < 200 || x.status > 299) { $("uph").textContent = "Не загрузилось (" + x.status + "): " + x.responseText.slice(0, 120); return; }
+    const { error } = await rpc("admin_add", { t: title, u: BASE + "public/videos/" + path });
+    $("uph").textContent = error ? error.message : "Готово: «" + title + "» в библиотеке. Жми «В эфир».";
+    if (!error) { $("ft").value = ""; loadList(); }
+  };
+  x.onerror = () => { $("pick").disabled = false; $("uph").textContent = "Нет связи. Попробуй ещё раз."; };
+  x.send(f);
+};
+$("off").onclick = async () => { const { error } = await rpc("admin_stop"); if (error) alert(error.message); };
+$("chg").onclick = async () => {
+  const np = $("np").value;
+  const { error } = await rpc("admin_set_pass", { newp: np });
+  if (error) { $("perr").textContent = error.message; return; }
+  PASS = np; sessionStorage.setItem("roptv_admin", np); $("np").value = ""; $("perr").textContent = "Пароль изменён.";
+};
+(async () => {
+  const saved = sessionStorage.getItem("roptv_admin");
+  if (!saved) return;
+  const { data } = await sb.rpc("admin_check", { p: saved });
+  if (data) { PASS = saved; enter(true); }
+})();
+</script>
+</body>
+</html>
