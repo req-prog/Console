@@ -294,6 +294,7 @@ function openLaunch(item) {
   dlg.showModal();
 }
 async function launch(fn) {
+  if (!pvDur) pvDur = await probe(lv.url);   // без длительности сервер не сможет сам переключить эфир на конец видео
   const { error } = await rpc(fn, { t: lv.title, u: lv.url, st: startAt(), d: pvDur });
   if (error) { alert(error.message); return; }
   dlg.close(); refresh();
